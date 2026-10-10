@@ -1,0 +1,496 @@
+name: Build Flutter APK (Auto-Detect)
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_file:
+        description: 'ZIP file name (contoh: BASE APPS VALHALLA V1.zip)'
+        required: true
+      build_type:
+        description: 'Build type'
+        required: true
+        default: 'release'
+        type: choice
+        options:
+          - release
+          - debug
+      flutter_version:
+        description: 'Flutter version (kosongkan = stable terbaru, isi = versi spesifik, contoh: 3.24.0)'
+        required: false
+        default: ''
+      java_version:
+        description: 'Java version (kosongkan = auto 17)'
+        required: false
+        default: ''
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ============================================================
+      # STEP 1: Setup Flutter (versi ditentukan / stable terbaru)
+      # ============================================================
+      - name: Setup Flutter
+        id: flutter_setup
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ github.event.inputs.flutter_version || '' }}
+          channel: 'stable'
+          cache: true
+
+      - name: Show Flutter & Dart version
+        run: |
+          flutter --version
+          dart --version
+          echo "FLUTTER_ROOT=$FLUTTER_ROOT" >> $GITHUB_ENV
+
+      # ============================================================
+      # STEP 2: Detect versi yang dibutuhkan Flutter SDK ini
+      #         (Flutter punya file versions.json / template)
+      # ============================================================
+      - name: 🔍 Detect required versions from Flutter SDK
+        id: flutter_reqs
+        run: |
+          echo "════════════════════════════════════════"
+          echo "🔍 Membaca requirement dari Flutter SDK"
+          echo "════════════════════════════════════════"
+
+          # --- Gradle minimum yang didukung Flutter ini ---
+          # Cek dari file di Flutter SDK: packages/flutter_tools/gradle/src/main/groovy/flutter.groovy
+          # atau dari template: packages/flutter_tools/templates/app_shared/android.tmpl/gradle/wrapper/gradle-wrapper.properties.tmpl
+          GRADLE_MIN=""
+          TEMPLATE_WRAPPER="$FLUTTER_ROOT/packages/flutter_tools/templates/app_shared/android.tmpl/gradle/wrapper/gradle-wrapper.properties.tmpl"
+          if [ -f "$TEMPLATE_WRAPPER" ]; then
+            GRADLE_MIN=$(grep -oE 'gradle-[0-9]+\.[0-9]+(\.[0-9]+)?' "$TEMPLATE_WRAPPER" | head -n 1 | sed 's/gradle-//')
+          fi
+
+          # Fallback: cek file gradle_utils.dart untuk konstanta min versi
+          if [ -z "$GRADLE_MIN" ]; then
+            GRADLE_MIN=$(grep -rhoE "min.*Gradle.*version.*=.*['\"][0-9]+\.[0-9]+(\.[0-9]+)?['\"]" \
+              "$FLUTTER_ROOT/packages/flutter_tools/lib/src/android/" 2>/dev/null \
+              | grep -oE "[0-9]+\.[0-9]+(\.[0-9]+)?" | head -n 1)
+          fi
+          # Default minimum aman untuk Flutter 3.4x+
+          if [ -z "$GRADLE_MIN" ]; then GRADLE_MIN="8.14.0"; fi
+          echo "📌 Gradle minimum (Flutter): $GRADLE_MIN"
+
+          # --- AGP minimum ---
+          TEMPLATE_SETTINGS="$FLUTTER_ROOT/packages/flutter_tools/templates/app_shared/android.tmpl/settings.gradle.kts.tmpl"
+          AGP_MIN=""
+          if [ -f "$TEMPLATE_SETTINGS" ]; then
+            AGP_MIN=$(grep -oE 'com\.android\.application["'"'"')]* version ["'"'"'][0-9]+\.[0-9]+(\.[0-9]+)?' "$TEMPLATE_SETTINGS" | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n 1)
+          fi
+          if [ -z "$AGP_MIN" ]; then AGP_MIN="8.9.1"; fi
+          echo "📌 AGP minimum (Flutter): $AGP_MIN"
+
+          # --- Kotlin minimum ---
+          KOTLIN_MIN=""
+          if [ -f "$TEMPLATE_SETTINGS" ]; then
+            KOTLIN_MIN=$(grep -oE 'org\.jetbrains\.kotlin\.android["'"'"')]* version ["'"'"'][0-9]+\.[0-9]+(\.[0-9]+)?' "$TEMPLATE_SETTINGS" | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n 1)
+          fi
+          if [ -z "$KOTLIN_MIN" ]; then KOTLIN_MIN="2.1.0"; fi
+          echo "📌 Kotlin minimum (Flutter): $KOTLIN_MIN"
+
+          # --- Java yang didukung ---
+          # Flutter 3.4x+ pakai Java 17. Beberapa pakai 21.
+          JAVA_REQ="17"
+          echo "📌 Java target: $JAVA_REQ"
+
+          # --- compileSdk & NDK default dari Flutter template ---
+          TEMPLATE_APP="$FLUTTER_ROOT/packages/flutter_tools/templates/app_shared/android.tmpl/app/build.gradle.kts.tmpl"
+          COMPILE_SDK_DEFAULT=""
+          NDK_DEFAULT=""
+          if [ -f "$TEMPLATE_APP" ]; then
+            COMPILE_SDK_DEFAULT=$(grep -oE 'compileSdk\s*=?\s*[0-9]+' "$TEMPLATE_APP" | grep -oE '[0-9]+' | head -n 1)
+            NDK_DEFAULT=$(grep -oE 'ndkVersion\s*=?\s*["'"'"'][0-9.]+' "$TEMPLATE_APP" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+          fi
+          if [ -z "$COMPILE_SDK_DEFAULT" ]; then COMPILE_SDK_DEFAULT="36"; fi
+          echo "📌 compileSdk default: $COMPILE_SDK_DEFAULT"
+          echo "📌 NDK default: ${NDK_DEFAULT:-auto}"
+
+          # --- Simpan ke output ---
+          echo "gradle_min=$GRADLE_MIN" >> $GITHUB_OUTPUT
+          echo "agp_min=$AGP_MIN" >> $GITHUB_OUTPUT
+          echo "kotlin_min=$KOTLIN_MIN" >> $GITHUB_OUTPUT
+          echo "java_req=$JAVA_REQ" >> $GITHUB_OUTPUT
+          echo "compile_sdk_default=$COMPILE_SDK_DEFAULT" >> $GITHUB_OUTPUT
+          echo "ndk_default=$NDK_DEFAULT" >> $GITHUB_OUTPUT
+
+      # ============================================================
+      # STEP 3: Setup Java (auto dari Flutter requirement)
+      # ============================================================
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: ${{ github.event.inputs.java_version || steps.flutter_reqs.outputs.java_req || '17' }}
+
+      # ============================================================
+      # STEP 4: Extract ZIP project
+      # ============================================================
+      - name: Extract project
+        run: |
+          if [ ! -f "${{ github.event.inputs.zip_file }}" ]; then
+            echo "❌ File ZIP tidak ditemukan: ${{ github.event.inputs.zip_file }}"
+            echo "File di root repo:"
+            ls -la
+            exit 1
+          fi
+          mkdir -p project
+          unzip -o "${{ github.event.inputs.zip_file }}" -d project
+          echo "✅ Project extracted"
+
+      - name: Find pubspec.yaml
+        id: find_pubspec
+        run: |
+          PUBSPEC=$(find project -name "pubspec.yaml" -maxdepth 4 -not -path "*/build/*" | head -n 1)
+          if [ -z "$PUBSPEC" ]; then
+            echo "❌ pubspec.yaml tidak ditemukan!"
+            exit 1
+          fi
+          DIR=$(dirname "$PUBSPEC")
+          echo "project_dir=$DIR" >> $GITHUB_OUTPUT
+          echo "✅ Project ditemukan di: $DIR"
+
+      # ============================================================
+      # STEP 5: Detect versi dari project (compileSdk, NDK, dll)
+      # ============================================================
+      - name: 🔍 Detect versions from project
+        id: project_versions
+        working-directory: ${{ steps.find_pubspec.outputs.project_dir }}
+        run: |
+          echo "════════════════════════════════════════"
+          echo "🔍 Detect versi dari project"
+          echo "════════════════════════════════════════"
+
+          DETECTED_SDK=""
+          DETECTED_NDK=""
+          DETECTED_MIN_SDK=""
+          DETECTED_TARGET_SDK=""
+
+          for f in $(find android -name "build.gradle" -o -name "build.gradle.kts" 2>/dev/null | head -n 20); do
+            # compileSdk
+            SDK=$(grep -oE 'compileSdk(Version)?\s*=?\s*[0-9]+' "$f" 2>/dev/null | grep -oE '[0-9]+' | head -n 1)
+            if [ -n "$SDK" ] && [ -z "$DETECTED_SDK" ]; then DETECTED_SDK="$SDK"; fi
+
+            # ndkVersion
+            NDK=$(grep -oE 'ndkVersion\s*=?\s*["'"'"'][0-9.]+' "$f" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+            if [ -n "$NDK" ] && [ -z "$DETECTED_NDK" ]; then DETECTED_NDK="$NDK"; fi
+
+            # minSdk
+            MINSDK=$(grep -oE 'minSdk(Version)?\s*=?\s*[0-9]+' "$f" 2>/dev/null | grep -oE '[0-9]+' | head -n 1)
+            if [ -n "$MINSDK" ] && [ -z "$DETECTED_MIN_SDK" ]; then DETECTED_MIN_SDK="$MINSDK"; fi
+
+            # targetSdk
+            TARGETSDK=$(grep -oE 'targetSdk(Version)?\s*=?\s*[0-9]+' "$f" 2>/dev/null | grep -oE '[0-9]+' | head -n 1)
+            if [ -n "$TARGETSDK" ] && [ -z "$DETECTED_TARGET_SDK" ]; then DETECTED_TARGET_SDK="$TARGETSDK"; fi
+          done
+
+          # Fallback ke default Flutter kalau kosong
+          if [ -z "$DETECTED_SDK" ]; then DETECTED_SDK="${{ steps.flutter_reqs.outputs.compile_sdk_default }}"; fi
+          if [ -z "$DETECTED_NDK" ]; then DETECTED_NDK="${{ steps.flutter_reqs.outputs.ndk_default }}"; fi
+
+          echo "📱 compileSdk (project): ${DETECTED_SDK:-auto}"
+          echo "🔧 ndkVersion (project): ${DETECTED_NDK:-auto}"
+          echo "📉 minSdk: ${DETECTED_MIN_SDK:-not found}"
+          echo "🎯 targetSdk: ${DETECTED_TARGET_SDK:-not found}"
+
+          echo "detected_sdk=$DETECTED_SDK" >> $GITHUB_OUTPUT
+          echo "detected_ndk=$DETECTED_NDK" >> $GITHUB_OUTPUT
+          echo "detected_min_sdk=$DETECTED_MIN_SDK" >> $GITHUB_OUTPUT
+          echo "detected_target_sdk=$DETECTED_TARGET_SDK" >> $GITHUB_OUTPUT
+
+      # ============================================================
+      # STEP 6: Setup Android SDK environment
+      # ============================================================
+      - name: Setup Android SDK environment
+        run: |
+          if [ -z "$ANDROID_HOME" ]; then
+            export ANDROID_HOME=/usr/local/lib/android/sdk
+            echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
+          fi
+          if [ -z "$ANDROID_SDK_ROOT" ]; then
+            export ANDROID_SDK_ROOT=$ANDROID_HOME
+            echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> $GITHUB_ENV
+          fi
+
+          SDKMANAGER=""
+          for path in \
+            "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "$ANDROID_HOME/cmdline-tools/16.0/bin/sdkmanager" \
+            "$ANDROID_HOME/cmdline-tools/12.0/bin/sdkmanager" \
+            "$ANDROID_HOME/tools/bin/sdkmanager"; do
+            if [ -f "$path" ]; then SDKMANAGER="$path"; break; fi
+          done
+
+          if [ -z "$SDKMANAGER" ]; then
+            echo "❌ sdkmanager tidak ditemukan!"
+            exit 1
+          fi
+
+          echo "✅ SDKMANAGER: $SDKMANAGER"
+          echo "SDKMANAGER_PATH=$SDKMANAGER" >> $GITHUB_ENV
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          echo "✅ SDK licenses accepted"
+
+      # ============================================================
+      # STEP 7: Install SDK Platform & Build Tools (auto)
+      # ============================================================
+      - name: Install SDK Platform & Build Tools
+        run: |
+          SDK_API="${{ steps.project_versions.outputs.detected_sdk }}"
+          if [ -z "$SDK_API" ]; then SDK_API="36"; fi
+          echo "📦 Install platform: android-$SDK_API"
+
+          "$SDKMANAGER_PATH" "platforms;android-${SDK_API}" > /dev/null 2>&1 || {
+            echo "⚠️ Fallback ke android-34"
+            "$SDKMANAGER_PATH" "platforms;android-34" > /dev/null 2>&1 || true
+          }
+
+          # Install build-tools yang match + beberapa versi umum sebagai fallback
+          for BT in "${SDK_API}.0.0" "36.0.0" "35.0.0" "34.0.0"; do
+            "$SDKMANAGER_PATH" "build-tools;${BT}" > /dev/null 2>&1 || true
+          done
+
+          "$SDKMANAGER_PATH" "platform-tools" > /dev/null 2>&1 || true
+          echo "✅ SDK Platform & Build Tools installed"
+
+      # ============================================================
+      # STEP 8: Install NDK (auto, hanya kalau project butuh)
+      # ============================================================
+      - name: Install NDK (if needed)
+        run: |
+          NDK_VER="${{ steps.project_versions.outputs.detected_ndk }}"
+          if [ -z "$NDK_VER" ]; then
+            echo "ℹ️ NDK tidak diperlukan untuk project ini"
+            exit 0
+          fi
+
+          echo "📦 Install NDK: $NDK_VER"
+          if "$SDKMANAGER_PATH" "ndk;${NDK_VER}" > /dev/null 2>&1; then
+            echo "✅ NDK $NDK_VER installed"
+          else
+            # Fallback ke versi NDK populer
+            for FB in "28.2.13676358" "27.2.12479018" "27.0.12077973" "26.3.11579264" "26.1.10909125"; do
+              if "$SDKMANAGER_PATH" "ndk;${FB}" > /dev/null 2>&1; then
+                NDK_VER="$FB"
+                echo "✅ Fallback NDK: $FB"
+                break
+              fi
+            done
+          fi
+
+          if [ -d "$ANDROID_HOME/ndk/${NDK_VER}" ]; then
+            echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${NDK_VER}" >> $GITHUB_ENV
+            echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/${NDK_VER}" >> $GITHUB_ENV
+            echo "✅ NDK env diset"
+          fi
+
+      # ============================================================
+      # STEP 9: Auto-Fix Gradle, AGP, Kotlin (semua otomatis)
+      # ============================================================
+      - name: 🔧 Auto-Fix Gradle, AGP, Kotlin
+        working-directory: ${{ steps.find_pubspec.outputs.project_dir }}
+        env:
+          GRADLE_MIN: ${{ steps.flutter_reqs.outputs.gradle_min }}
+          AGP_MIN: ${{ steps.flutter_reqs.outputs.agp_min }}
+          KOTLIN_MIN: ${{ steps.flutter_reqs.outputs.kotlin_min }}
+        run: |
+          echo "════════════════════════════════════════"
+          echo "🔧 AUTO-FIX Build Config"
+          echo "════════════════════════════════════════"
+          echo "Target: Gradle>=$GRADLE_MIN, AGP>=$AGP_MIN, Kotlin>=$KOTLIN_MIN"
+          echo ""
+
+          # --- Helper: bandingkan versi (return 0 kalau v1 >= v2) ---
+          version_gte() {
+            [ "$(printf '%s\n' "$1" "$2" | sort -V | head -n1)" = "$2" ]
+          }
+
+          # ============================================
+          # 1. FIX GRADLE WRAPPER
+          # ============================================
+          WRAPPER="android/gradle/wrapper/gradle-wrapper.properties"
+          if [ ! -f "$WRAPPER" ]; then
+            echo "⚠️ $WRAPPER tidak ada, skip."
+          else
+            OLD_GRADLE=$(grep -oE 'gradle-[0-9]+\.[0-9]+(\.[0-9]+)?' "$WRAPPER" | head -n 1 | sed 's/gradle-//')
+            echo "📌 Gradle sekarang: ${OLD_GRADLE:-unknown}"
+
+            # Pakai versi minimum Flutter, atau versi project kalau lebih baru
+            TARGET_GRADLE="$GRADLE_MIN"
+            if [ -n "$OLD_GRADLE" ] && version_gte "$OLD_GRADLE" "$GRADLE_MIN"; then
+              TARGET_GRADLE="$OLD_GRADLE"
+            fi
+
+            if [ "$OLD_GRADLE" != "$TARGET_GRADLE" ]; then
+              echo "⬆️ Update Gradle: $OLD_GRADLE → $TARGET_GRADLE"
+              # Tulis ulang distributionUrl (aman dari regex BRE yang gagal match)
+              grep -v '^distributionUrl' "$WRAPPER" > "${WRAPPER}.tmp" || true
+              echo "distributionUrl=https\\://services.gradle.org/distributions/gradle-${TARGET_GRADLE}-all.zip" >> "${WRAPPER}.tmp"
+              mv "${WRAPPER}.tmp" "$WRAPPER"
+            else
+              echo "ℹ️ Gradle sudah OK: $TARGET_GRADLE"
+            fi
+
+            # Verifikasi
+            VERIFY=$(grep -oE 'gradle-[0-9]+\.[0-9]+(\.[0-9]+)?' "$WRAPPER" | head -n 1 | sed 's/gradle-//')
+            echo "✅ Gradle final: $VERIFY"
+            if ! version_gte "$VERIFY" "$GRADLE_MIN"; then
+              echo "❌ Gradle masih < $GRADLE_MIN!"
+              cat "$WRAPPER"
+              exit 1
+            fi
+          fi
+
+          # ============================================
+          # 2. FIX AGP
+          # ============================================
+          echo ""
+          echo "🔧 Fix AGP → target >= $AGP_MIN"
+
+          for f in android/settings.gradle.kts android/settings.gradle android/build.gradle.kts android/build.gradle; do
+            [ -f "$f" ] || continue
+            echo "  📄 $f"
+
+            # Cek apakah versi lama < AGP_MIN, kalau ya update
+            CURRENT_AGP=$(grep -oE 'com\.android\.(application|library|tools\.build:gradle)[^0-9]*[0-9]+\.[0-9]+(\.[0-9]+)?' "$f" | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n 1 || true)
+            if [ -n "$CURRENT_AGP" ] && version_gte "$CURRENT_AGP" "$AGP_MIN"; then
+              echo "    ℹ️ AGP sudah OK: $CURRENT_AGP"
+              continue
+            fi
+
+            # Update semua bentuk referensi AGP
+            sed -i -E "s|com\.android\.tools\.build:gradle:[0-9]+\.[0-9]+(\.[0-9]+)?|com.android.tools.build:gradle:${AGP_MIN}|g" "$f"
+            sed -i -E "s|com\.android\.application:[0-9]+\.[0-9]+(\.[0-9]+)?|com.android.application:${AGP_MIN}|g" "$f"
+            sed -i -E "s|com\.android\.library:[0-9]+\.[0-9]+(\.[0-9]+)?|com.android.library:${AGP_MIN}|g" "$f"
+            sed -i -E "s|id\(\"com\.android\.application\"\)\s*version\s*\"[0-9]+\.[0-9]+(\.[0-9]+)?\"|id(\"com.android.application\") version \"${AGP_MIN}\"|g" "$f"
+            sed -i -E "s|id\('com\.android\.application'\)\s*version\s*'[0-9]+\.[0-9]+(\.[0-9]+)?'|id('com.android.application') version '${AGP_MIN}'|g" "$f"
+            echo "    ✅ AGP → $AGP_MIN"
+          done
+
+          # ============================================
+          # 3. FIX KOTLIN
+          # ============================================
+          echo ""
+          echo "🔧 Fix Kotlin → target >= $KOTLIN_MIN"
+          for f in android/settings.gradle.kts android/settings.gradle android/build.gradle.kts android/build.gradle; do
+            [ -f "$f" ] || continue
+            CURRENT_KOTLIN=$(grep -oE 'org\.jetbrains\.kotlin[^0-9]*[0-9]+\.[0-9]+(\.[0-9]+)?' "$f" | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n 1 || true)
+            if [ -n "$CURRENT_KOTLIN" ] && version_gte "$CURRENT_KOTLIN" "$KOTLIN_MIN"; then
+              echo "  ℹ️ $f: Kotlin OK ($CURRENT_KOTLIN)"
+              continue
+            fi
+
+            sed -i -E "s|org\.jetbrains\.kotlin[^:]*:[0-9]+\.[0-9]+(\.[0-9]+)?|org.jetbrains.kotlin:kotlin-gradle-plugin:${KOTLIN_MIN}|g" "$f"
+            sed -i -E "s|id\(\"org\.jetbrains\.kotlin\.android\"\)\s*version\s*\"[0-9]+\.[0-9]+(\.[0-9]+)?\"|id(\"org.jetbrains.kotlin.android\") version \"${KOTLIN_MIN}\"|g" "$f"
+            sed -i -E "s|id\('org\.jetbrains\.kotlin\.android'\)\s*version\s*'[0-9]+\.[0-9]+(\.[0-9]+)?'|id('org.jetbrains.kotlin.android') version '${KOTLIN_MIN}'|g" "$f"
+            echo "  ✅ $f: Kotlin → $KOTLIN_MIN"
+          done
+
+          # ============================================
+          # 4. FIX gradle.properties untuk AGP 8+
+          # ============================================
+          echo ""
+          echo "🔧 Fix gradle.properties"
+          GP="android/gradle.properties"
+          if [ -f "$GP" ]; then
+            # Hapus setting lama yang konflik
+            sed -i '/^android.enableR8=/d' "$GP" || true
+            # Pastikan AndroidX aktif
+            grep -q '^android.useAndroidX=' "$GP" || echo "android.useAndroidX=true" >> "$GP"
+            grep -q '^android.enableJetifier=' "$GP" || echo "android.enableJetifier=true" >> "$GP"
+            grep -q '^org.gradle.jvmargs=' "$GP" || echo "org.gradle.jvmargs=-Xmx4G -XX:MaxMetaspaceSize=1G" >> "$GP"
+            echo "  ✅ gradle.properties OK"
+          fi
+
+          # ============================================
+          # 5. FIX local.properties (nanti di step terpisah)
+          # ============================================
+          echo ""
+          echo "════════════════════════════════════════"
+          echo "✅ AUTO-FIX SELESAI"
+          echo "════════════════════════════════════════"
+          echo "📄 Final gradle-wrapper.properties:"
+          cat "$WRAPPER" 2>/dev/null || true
+          echo ""
+          echo "📄 Final settings.gradle.kts:"
+          head -n 30 android/settings.gradle.kts 2>/dev/null || true
+          echo ""
+          echo "📄 Final android/build.gradle.kts:"
+          head -n 15 android/build.gradle.kts 2>/dev/null || true
+
+      # ============================================================
+      # STEP 10: Setup local.properties
+      # ============================================================
+      - name: Setup local.properties
+        working-directory: ${{ steps.find_pubspec.outputs.project_dir }}
+        run: |
+          if [ ! -d android ]; then
+            echo "⚠️ Folder android tidak ada, skip local.properties"
+            exit 0
+          fi
+          if [ -f "android/local.properties" ]; then
+            grep -v -E '^(sdk.dir|flutter.sdk)=' android/local.properties > android/local.properties.tmp || true
+            mv android/local.properties.tmp android/local.properties
+          fi
+          echo "sdk.dir=$ANDROID_HOME" >> android/local.properties
+          echo "flutter.sdk=$FLUTTER_ROOT" >> android/local.properties
+          echo "✅ local.properties updated:"
+          cat android/local.properties
+
+      # ============================================================
+      # STEP 11: Pub get & clean
+      # ============================================================
+      - name: Flutter pub get
+        working-directory: ${{ steps.find_pubspec.outputs.project_dir }}
+        run: flutter pub get
+
+      - name: Flutter clean
+        working-directory: ${{ steps.find_pubspec.outputs.project_dir }}
+        run: flutter clean || true
+
+      - name: Flutter pub get (after clean)
+        working-directory: ${{ steps.find_pubspec.outputs.project_dir }}
+        run: flutter pub get
+
+      # ============================================================
+      # STEP 12: Build APK
+      # ============================================================
+      - name: Build APK
+        working-directory: ${{ steps.find_pubspec.outputs.project_dir }}
+        run: |
+          BUILD_TYPE="${{ github.event.inputs.build_type }}"
+          if [ "$BUILD_TYPE" = "release" ]; then
+            echo "🚀 Building RELEASE APK..."
+            flutter build apk --release --no-tree-shake-icons || {
+              echo "⚠️ Retry tanpa --no-tree-shake-icons..."
+              flutter build apk --release
+            }
+          else
+            echo "🐞 Building DEBUG APK..."
+            flutter build apk --debug
+          fi
+
+      # ============================================================
+      # STEP 13: Verifikasi & Upload
+      # ============================================================
+      - name: Check APK output
+        working-directory: ${{ steps.find_pubspec.outputs.project_dir }}
+        run: |
+          ls -lah build/app/outputs/flutter-apk/ || {
+            echo "❌ Folder APK tidak ditemukan!"
+            find . -name "*.apk" -type f 2>/dev/null || true
+            exit 1
+          }
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: flutter-apk-${{ github.event.inputs.build_type }}-${{ github.run_number }}
+          path: ${{ steps.find_pubspec.outputs.project_dir }}/build/app/outputs/flutter-apk/*.apk
+          if-no-files-found: error
+          retention-days: 14
