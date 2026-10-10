@@ -1,0 +1,417 @@
+name: Android Auto Build
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build type'
+        required: true
+        default: 'release'
+        type: choice
+        options:
+          - release
+          - debug
+          - both
+      zip_file:
+        description: 'Nama file ZIP (kosongkan kalau project sudah ada di repo)'
+        required: false
+        default: ''
+      flutter_version:
+        description: 'Flutter version (kosongkan = stable terbaru)'
+        required: false
+        default: ''
+      java_version:
+        description: 'Java version (kosongkan = 17)'
+        required: false
+        default: ''
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # ============================================================
+      # 1. Tentukan build type
+      # ============================================================
+      - name: Determine build type
+        id: config
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            BT="${{ github.event.inputs.build_type }}"
+          else
+            BT="release"
+          fi
+          echo "build_type=$BT" >> $GITHUB_OUTPUT
+          echo "✅ Build type: $BT"
+
+      # ============================================================
+      # 2. Extract ZIP (kalau ada)
+      # ============================================================
+      - name: Extract ZIP (if any)
+        run: |
+          ZIP_INPUT="${{ github.event.inputs.zip_file }}"
+          if [ -n "$ZIP_INPUT" ] && [ -f "$ZIP_INPUT" ]; then
+            echo "📦 Extracting: $ZIP_INPUT"
+            mkdir -p extracted
+            unzip -o "$ZIP_INPUT" -d extracted
+          fi
+
+      # ============================================================
+      # 3. Cari project (Flutter / Android native)
+      # ============================================================
+      - name: Detect project type & location
+        id: detect_project
+        run: |
+          echo "════════════════════════════════════════"
+          echo "🔍 Deteksi tipe project"
+          echo "════════════════════════════════════════"
+
+          FLUTTER_PROJECT=""
+          ANDROID_PROJECT=""
+
+          for BASE in . extracted; do
+            [ -d "$BASE" ] || continue
+
+            if [ -z "$FLUTTER_PROJECT" ]; then
+              PUBSPEC=$(find "$BASE" -maxdepth 5 -name "pubspec.yaml" \
+                -not -path "*/build/*" -not -path "*/.dart_tool/*" 2>/dev/null | head -n 1)
+              [ -n "$PUBSPEC" ] && FLUTTER_PROJECT=$(dirname "$PUBSPEC")
+            fi
+
+            if [ -z "$ANDROID_PROJECT" ]; then
+              SETTINGS=$(find "$BASE" -maxdepth 5 \( -name "settings.gradle" -o -name "settings.gradle.kts" \) 2>/dev/null \
+                | grep -v "/build/" | head -n 1)
+              [ -n "$SETTINGS" ] && ANDROID_PROJECT=$(dirname "$SETTINGS")
+            fi
+          done
+
+          if [ -n "$FLUTTER_PROJECT" ]; then
+            echo "✅ Flutter project: $FLUTTER_PROJECT"
+            echo "project_type=flutter" >> $GITHUB_OUTPUT
+            echo "project_dir=$FLUTTER_PROJECT" >> $GITHUB_OUTPUT
+          elif [ -n "$ANDROID_PROJECT" ]; then
+            echo "✅ Android native project: $ANDROID_PROJECT"
+            echo "project_type=android" >> $GITHUB_OUTPUT
+            echo "project_dir=$ANDROID_PROJECT" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Tidak menemukan project Flutter maupun Android!"
+            ls -la
+            exit 1
+          fi
+
+      # ============================================================
+      # 4. Setup Java
+      # ============================================================
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: ${{ github.event.inputs.java_version || '17' }}
+
+      # ============================================================
+      # 5. Setup Flutter (kalau project Flutter)
+      # ============================================================
+      - name: Setup Flutter
+        if: steps.detect_project.outputs.project_type == 'flutter'
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ github.event.inputs.flutter_version || '' }}
+          channel: 'stable'
+          cache: true
+
+      - name: Show Flutter version
+        if: steps.detect_project.outputs.project_type == 'flutter'
+        run: |
+          flutter --version
+          echo "FLUTTER_ROOT=$FLUTTER_ROOT" >> $GITHUB_ENV
+
+      # ============================================================
+      # 6. Setup Android SDK — FIX: Pakai sdkmanager bawaan runner
+      # ============================================================
+      - name: Find or Setup sdkmanager
+        run: |
+          echo "════════════════════════════════════════"
+          echo "🔧 Mencari sdkmanager bawaan runner..."
+          echo "════════════════════════════════════════"
+
+          SDKMANAGER_PATH=""
+          # Cek lokasi-lokasi umum sdkmanager di runner GitHub
+          for path in \
+            "/usr/local/lib/android/sdk/cmdline-tools/latest/bin/sdkmanager" \
+            "/usr/local/lib/android/sdk/cmdline-tools/12.0/bin/sdkmanager" \
+            "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "$ANDROID_HOME/cmdline-tools/12.0/bin/sdkmanager"; do
+            if [ -f "$path" ]; then
+              SDKMANAGER_PATH="$path"
+              echo "✅ sdkmanager ditemukan: $SDKMANAGER_PATH"
+              break
+            fi
+          done
+
+          # Kalau tidak ada, install manual (fallback)
+          if [ -z "$SDKMANAGER_PATH" ]; then
+            echo "⚠️ sdkmanager tidak ditemukan. Mencoba install manual..."
+            mkdir -p $ANDROID_HOME/cmdline-tools
+            cd $ANDROID_HOME/cmdline-tools
+            # Download versi yang lebih lama tapi stabil
+            curl -sL -o cmdline-tools.zip "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip" || true
+            if [ -f cmdline-tools.zip ]; then
+              unzip -q cmdline-tools.zip
+              rm cmdline-tools.zip
+              mv cmdline-tools latest 2>/dev/null || true
+              SDKMANAGER_PATH="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+              echo "✅ sdkmanager terinstall: $SDKMANAGER_PATH"
+            fi
+          fi
+
+          if [ -z "$SDKMANAGER_PATH" ] || [ ! -f "$SDKMANAGER_PATH" ]; then
+            echo "❌ Gagal mendapatkan sdkmanager. Build tidak bisa dilanjutkan."
+            exit 1
+          fi
+
+          echo "SDKMANAGER_PATH=$SDKMANAGER_PATH" >> $GITHUB_ENV
+          echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
+        continue-on-error: false
+
+      # ============================================================
+      # 7. Detect versi project (SDK, NDK)
+      # ============================================================
+      - name: Detect versions from project
+        id: project_versions
+        working-directory: ${{ steps.detect_project.outputs.project_dir }}
+        run: |
+          if [ -d "android" ]; then ANDROID_DIR="android"; else ANDROID_DIR="."; fi
+          echo "📁 Android dir: $ANDROID_DIR"
+
+          DETECTED_SDK=""
+          DETECTED_NDK=""
+
+          for f in $(find "$ANDROID_DIR" -maxdepth 6 \( -name "build.gradle" -o -name "build.gradle.kts" \) 2>/dev/null | grep -v "/build/"); do
+            SDK=$(grep -oE 'compileSdk(Version)?\s*[=:]?\s*[0-9]+' "$f" 2>/dev/null | grep -oE '[0-9]+' | head -n 1)
+            [ -n "$SDK" ] && [ -z "$DETECTED_SDK" ] && DETECTED_SDK="$SDK"
+
+            NDK=$(grep -oE 'ndkVersion\s*[=:]?\s*["'"'"'][0-9.]+' "$f" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+            [ -n "$NDK" ] && [ -z "$DETECTED_NDK" ] && DETECTED_NDK="$NDK"
+          done
+
+          [ -z "$DETECTED_SDK" ] && DETECTED_SDK="34"
+
+          echo "📱 compileSdk: $DETECTED_SDK"
+          echo "🔧 ndkVersion: ${DETECTED_NDK:-not needed}"
+
+          echo "detected_sdk=$DETECTED_SDK" >> $GITHUB_OUTPUT
+          echo "detected_ndk=$DETECTED_NDK" >> $GITHUB_OUTPUT
+
+      # ============================================================
+      # 8. Install SDK Platform + Build Tools
+      # ============================================================
+      - name: Install SDK Platform & Build Tools
+        run: |
+          SDK_API="${{ steps.project_versions.outputs.detected_sdk }}"
+          [ -z "$SDK_API" ] && SDK_API="34"
+          echo "📦 Installing platform: android-$SDK_API"
+
+          yes | "$SDKMANAGER_PATH" --licenses > /dev/null 2>&1 || true
+
+          "$SDKMANAGER_PATH" "platforms;android-${SDK_API}" > /dev/null 2>&1 || {
+            echo "⚠️ Fallback ke android-34"
+            "$SDKMANAGER_PATH" "platforms;android-34" > /dev/null 2>&1 || true
+          }
+
+          for BT in "${SDK_API}.0.0" "36.0.0" "35.0.0" "34.0.0"; do
+            "$SDKMANAGER_PATH" "build-tools;${BT}" > /dev/null 2>&1 || true
+          done
+
+          echo "✅ SDK Platform & Build Tools installed"
+
+      # ============================================================
+      # 9. Install NDK kalau ada
+      # ============================================================
+      - name: Install NDK (if needed)
+        run: |
+          NDK_VER="${{ steps.project_versions.outputs.detected_ndk }}"
+          if [ -z "$NDK_VER" ]; then
+            echo "ℹ️ NDK tidak diperlukan"
+            exit 0
+          fi
+
+          echo "📦 Installing NDK: $NDK_VER"
+          if "$SDKMANAGER_PATH" "ndk;${NDK_VER}" > /dev/null 2>&1; then
+            echo "✅ NDK $NDK_VER installed"
+          else
+            for FB in "28.2.13676358" "27.2.12479018" "27.0.12077973" "26.3.11579264" "26.1.10909125"; do
+              if "$SDKMANAGER_PATH" "ndk;${FB}" > /dev/null 2>&1; then
+                NDK_VER="$FB"; echo "✅ Fallback NDK: $FB"; break
+              fi
+            done
+          fi
+
+          if [ -d "$ANDROID_HOME/ndk/${NDK_VER}" ]; then
+            echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${NDK_VER}" >> $GITHUB_ENV
+            echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/${NDK_VER}" >> $GITHUB_ENV
+          fi
+
+      # ============================================================
+      # 10. Auto-Fix Gradle, AGP, Kotlin
+      # ============================================================
+      - name: Auto-Fix Gradle, AGP, Kotlin
+        working-directory: ${{ steps.detect_project.outputs.project_dir }}
+        env:
+          PROJECT_TYPE: ${{ steps.detect_project.outputs.project_type }}
+        run: |
+          echo "════════════════════════════════════════"
+          echo "🔧 AUTO-FIX"
+          echo "════════════════════════════════════════"
+
+          if [ -d "android" ]; then ANDROID_DIR="android"; else ANDROID_DIR="."; fi
+
+          # Default target
+          GRADLE_TARGET="8.14.0"
+          AGP_TARGET="8.9.1"
+          KOTLIN_TARGET="2.1.0"
+
+          # Fix Gradle wrapper
+          WRAPPER="$ANDROID_DIR/gradle/wrapper/gradle-wrapper.properties"
+          if [ -f "$WRAPPER" ]; then
+            OLD_GRADLE=$(grep -oE 'gradle-[0-9]+\.[0-9]+(\.[0-9]+)?' "$WRAPPER" | head -n 1 | sed 's/gradle-//')
+            echo "📌 Gradle lama: ${OLD_GRADLE:-unknown}"
+            echo "🎯 Target Gradle: $GRADLE_TARGET"
+
+            if [ "$OLD_GRADLE" != "$GRADLE_TARGET" ]; then
+              grep -v '^distributionUrl' "$WRAPPER" > "${WRAPPER}.tmp" || true
+              echo "distributionUrl=https\\://services.gradle.org/distributions/gradle-${GRADLE_TARGET}-all.zip" >> "${WRAPPER}.tmp"
+              mv "${WRAPPER}.tmp" "$WRAPPER"
+              echo "✅ Gradle updated"
+            fi
+            cat "$WRAPPER"
+          fi
+
+          # Fix AGP + Kotlin
+          for f in "$ANDROID_DIR/settings.gradle.kts" "$ANDROID_DIR/settings.gradle" "$ANDROID_DIR/build.gradle.kts" "$ANDROID_DIR/build.gradle"; do
+            [ -f "$f" ] || continue
+            echo "🔧 Fix: $f"
+
+            sed -i -E "s|com\.android\.tools\.build:gradle:[0-9]+\.[0-9]+(\.[0-9]+)?|com.android.tools.build:gradle:${AGP_TARGET}|g" "$f"
+            sed -i -E "s|com\.android\.application:[0-9]+\.[0-9]+(\.[0-9]+)?|com.android.application:${AGP_TARGET}|g" "$f"
+            sed -i -E "s|com\.android\.library:[0-9]+\.[0-9]+(\.[0-9]+)?|com.android.library:${AGP_TARGET}|g" "$f"
+            sed -i -E "s|id\(\"com\.android\.application\"\)\s*version\s*\"[0-9]+\.[0-9]+(\.[0-9]+)?\"|id(\"com.android.application\") version \"${AGP_TARGET}\"|g" "$f"
+            sed -i -E "s|id\('com\.android\.application'\)\s*version\s*'[0-9]+\.[0-9]+(\.[0-9]+)?'|id('com.android.application') version '${AGP_TARGET}'|g" "$f"
+
+            sed -i -E "s|org\.jetbrains\.kotlin[^:]*:[0-9]+\.[0-9]+(\.[0-9]+)?|org.jetbrains.kotlin:kotlin-gradle-plugin:${KOTLIN_TARGET}|g" "$f"
+            sed -i -E "s|id\(\"org\.jetbrains\.kotlin\.android\"\)\s*version\s*\"[0-9]+\.[0-9]+(\.[0-9]+)?\"|id(\"org.jetbrains.kotlin.android\") version \"${KOTLIN_TARGET}\"|g" "$f"
+            sed -i -E "s|id\('org\.jetbrains\.kotlin\.android'\)\s*version\s*'[0-9]+\.[0-9]+(\.[0-9]+)?'|id('org.jetbrains.kotlin.android') version '${KOTLIN_TARGET}'|g" "$f"
+          done
+
+          # Fix gradle.properties
+          GP="$ANDROID_DIR/gradle.properties"
+          if [ -f "$GP" ]; then
+            grep -q '^android.useAndroidX=' "$GP" || echo "android.useAndroidX=true" >> "$GP"
+            grep -q '^android.enableJetifier=' "$GP" || echo "android.enableJetifier=true" >> "$GP"
+            grep -q '^org.gradle.jvmargs=' "$GP" || echo "org.gradle.jvmargs=-Xmx4G -XX:MaxMetaspaceSize=1G" >> "$GP"
+          fi
+
+          echo "════════════════════════════════════════"
+          echo "✅ AUTO-FIX SELESAI"
+          echo "════════════════════════════════════════"
+
+      # ============================================================
+      # 11. Setup local.properties
+      # ============================================================
+      - name: Setup local.properties
+        working-directory: ${{ steps.detect_project.outputs.project_dir }}
+        run: |
+          if [ -d "android" ]; then LP="android/local.properties"; else LP="local.properties"; fi
+
+          if [ -f "$LP" ]; then
+            grep -v -E '^(sdk.dir|flutter.sdk|ndk.dir)=' "$LP" > "${LP}.tmp" || true
+            mv "${LP}.tmp" "$LP"
+          fi
+
+          echo "sdk.dir=$ANDROID_HOME" >> "$LP"
+          [ -n "$FLUTTER_ROOT" ] && echo "flutter.sdk=$FLUTTER_ROOT" >> "$LP"
+          [ -n "$ANDROID_NDK_HOME" ] && echo "ndk.dir=$ANDROID_NDK_HOME" >> "$LP"
+
+          echo "✅ $LP:"
+          cat "$LP"
+
+      # ============================================================
+      # 12. Build APK (Flutter)
+      # ============================================================
+      - name: Build APK (Flutter)
+        if: steps.detect_project.outputs.project_type == 'flutter'
+        working-directory: ${{ steps.detect_project.outputs.project_dir }}
+        run: |
+          flutter pub get
+          flutter clean || true
+          flutter pub get
+
+          BT="${{ steps.config.outputs.build_type }}"
+          case "$BT" in
+            release)
+              echo "🚀 Build RELEASE..."
+              flutter build apk --release --no-tree-shake-icons || flutter build apk --release
+              ;;
+            debug)
+              echo "🐞 Build DEBUG..."
+              flutter build apk --debug
+              ;;
+            both)
+              echo "🚀 Build RELEASE..."
+              flutter build apk --release --no-tree-shake-icons || flutter build apk --release
+              echo "🐞 Build DEBUG..."
+              flutter build apk --debug
+              ;;
+          esac
+
+      # ============================================================
+      # 13. Build APK (Android Native)
+      # ============================================================
+      - name: Build APK (Android Native)
+        if: steps.detect_project.outputs.project_type == 'android'
+        working-directory: ${{ steps.detect_project.outputs.project_dir }}
+        run: |
+          chmod +x ./gradlew 2>/dev/null || true
+          BT="${{ steps.config.outputs.build_type }}"
+          case "$BT" in
+            release) ./gradlew assembleRelease --no-daemon ;;
+            debug)   ./gradlew assembleDebug --no-daemon ;;
+            both)
+              ./gradlew assembleRelease --no-daemon
+              ./gradlew assembleDebug --no-daemon
+              ;;
+          esac
+
+      # ============================================================
+      # 14. Check & Upload APK
+      # ============================================================
+      - name: Check APK output
+        working-directory: ${{ steps.detect_project.outputs.project_dir }}
+        run: |
+          echo "🔍 Mencari file APK..."
+          APK_LIST=$(find . -type f -name "*.apk" 2>/dev/null | grep -v "/\.gradle/" || true)
+          if [ -z "$APK_LIST" ]; then
+            echo "❌ Tidak ada APK!"
+            find . -type d -name "outputs" 2>/dev/null | head
+            exit 1
+          fi
+          echo "✅ APK ditemukan:"
+          echo "$APK_LIST"
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ steps.config.outputs.build_type }}-${{ github.run_number }}
+          path: |
+            ${{ steps.detect_project.outputs.project_dir }}/**/*.apk
+            !**/.gradle/**
+          if-no-files-found: error
+          retention-days: 14
